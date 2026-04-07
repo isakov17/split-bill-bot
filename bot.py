@@ -23,8 +23,9 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище для настроек траты
+# Временные хранилища
 pending_expenses = {}
+active_calcs = {} # Хранит сгенерированные переводы для каждого чата
 
 # --- АВТО-КАТЕГОРИИ (ЭМОДЗИ) ---
 def get_emoji_for_desc(desc: str) -> str:
@@ -42,7 +43,7 @@ def get_emoji_for_desc(desc: str) -> str:
             return emoji
     return "🧾"
 
-# --- ГЕНЕРАТОР КЛАВИАТУРЫ ---
+# --- ГЕНЕРАТОР КЛАВИАТУРЫ ДЛЯ ТРАТ ---
 def get_expense_keyboard(expense_key: str, participants: dict, shares: dict, payer_id: int):
     builder = InlineKeyboardBuilder()
     
@@ -72,6 +73,51 @@ def get_expense_keyboard(expense_key: str, participants: dict, shares: dict, pay
     )
     
     return builder.as_markup()
+
+# --- ГЕНЕРАТОР СООБЩЕНИЯ ДЛЯ ИТОГОВ ---
+def get_calc_message(chat_id: int):
+    transfers = active_calcs.get(chat_id, [])
+    if not transfers:
+        return "✅ Все в расчете!", None
+
+    text_lines = ["📊 <b>ИТОГИ (Кликни, чтобы отметить перевод):</b>\n"]
+    builder = InlineKeyboardBuilder()
+
+    # Группировка по получателю
+    receivers = {}
+    for idx, t in enumerate(transfers):
+        if t["to_name"] not in receivers:
+            receivers[t["to_name"]] = []
+        receivers[t["to_name"]].append((idx, t))
+
+    for recv_name, recv_transfers in receivers.items():
+        total_recv = sum(t["amount"] for _, t in recv_transfers)
+        text_lines.append(f"\n📥 <b>Получатель: {recv_name}</b> (собирает {total_recv:.2f})")
+        
+        for idx, t in recv_transfers:
+            is_paid = t["expense_id"] is not None
+            status_icon = "✅" if is_paid else "❌"
+            strike_start = "<s>" if is_paid else ""
+            strike_end = "</s>" if is_paid else ""
+
+            text_lines.append(f"  {status_icon} {strike_start}от {t['from_name']} ➔ {t['amount']:.2f}{strike_end}")
+
+            # Кнопка для каждого перевода (в один столбец)
+            btn_text = f"{status_icon} {t['from_name']} ➔ {t['to_name']} ({t['amount']:.2f})"
+            builder.button(text=btn_text, callback_data=f"cpay_{idx}")
+
+    builder.adjust(1) 
+    builder.row(types.InlineKeyboardButton(text="🔔 Пингануть должников", callback_data="ping_debtors"))
+
+    return "\n".join(text_lines), builder.as_markup()
+
+
+@dp.message(Command("mock"))
+async def cmd_mock(message: types.Message):
+    fake_friends = ["Арсений", "Родион", "Кирилл", "Маша", "Дима", "Лена", "Юля", "Глеб", "Игорь", "Антон"]
+    for i, name in enumerate(fake_friends):
+        await db.add_participant(message.chat.id, 1000 + i, name)
+    await message.answer("🤖 <b>Режим теста:</b> Добавлено 10 фейковых друзей!")
 
 # --- ЗАЩИТА ОТ ПЕРЕЗАГРУЗКИ ---
 async def check_cache_or_delete(callback: types.CallbackQuery, expense_key: str):
@@ -140,16 +186,21 @@ async def cmd_history(message: types.Message):
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message):
-    history = await db.get_history(message.chat.id, limit=1000)
-    if not history: return await message.answer("Нет данных.")
+    history = await db.get_history_with_shares(message.chat.id, limit=1000)
     
+    if not history:
+        return await message.answer("Нет данных для выгрузки.")
+
     filename = f"expenses_{message.chat.id}.csv"
+    
     with open(filename, mode='w', encoding='utf-8-sig', newline='') as file:
         writer = csv.writer(file, delimiter=';')
-        writer.writerow(["ID", "Сумма", "Описание", "Плательщик"])
-        for row in history: writer.writerow(row)
-        
-    await message.answer_document(FSInputFile(filename), caption="📊 Отчет по тратам")
+        writer.writerow(["ID", "Сумма", "Описание", "Кто платил", "На кого делили"]) 
+        for row in history:
+            writer.writerow(row)
+
+    document = FSInputFile(filename)
+    await message.answer_document(document, caption="📊 Детальный отчет по всем тратам")
     os.remove(filename)
 
 # --- ОБРАБОТКА ТРАТЫ ---
@@ -159,7 +210,7 @@ async def process_expense(message: types.Message):
     match = re.match(pattern, message.text, re.IGNORECASE)
     
     if not match or (not match.group('prefix') and not match.group('currency')):
-        return # Игнорируем обычные сообщения с цифрами
+        return 
 
     amount = float(match.group('amount').replace(',', '.'))
     raw_desc = match.group('desc').strip()
@@ -181,7 +232,7 @@ async def process_expense(message: types.Message):
     await message.reply(f"💰 <b>{amount:.2f}</b> — <i>{desc}</i>\nНа кого делим?", 
                         reply_markup=kb, parse_mode="HTML")
 
-# --- CALLBACKS ---
+# --- CALLBACKS ДЛЯ ТРАТ ---
 
 @dp.callback_query(F.data.startswith("tgl_"))
 async def toggle_share(callback: types.CallbackQuery):
@@ -274,21 +325,95 @@ async def cmd_calc(message: types.Message):
     balances = await db.get_balances(message.chat.id)
     if not balances: return await message.answer("Данных нет.")
     
-    creditors = sorted([[d["name"], d["balance"]] for d in balances.values() if d["balance"] > 0.01], key=lambda x: x[1], reverse=True)
-    debtors = sorted([[d["name"], -d["balance"]] for d in balances.values() if d["balance"] < -0.01], key=lambda x: x[1], reverse=True)
+    # Собираем кредиторов (кому должны) и должников (кто должен)
+    creditors = sorted([[uid, d["name"], d["balance"]] for uid, d in balances.items() if d["balance"] > 0.01], key=lambda x: x[2], reverse=True)
+    debtors = sorted([[uid, d["name"], -d["balance"]] for uid, d in balances.items() if d["balance"] < -0.01], key=lambda x: x[2], reverse=True)
     
-    res = []
+    transfers = []
     i = j = 0
     while i < len(creditors) and j < len(debtors):
-        pay = min(creditors[i][1], debtors[j][1])
-        res.append(f"💸 <b>{debtors[j][0]}</b> ➔ <b>{creditors[i][0]}</b>: {pay:.2f}")
-        creditors[i][1] -= pay
-        debtors[j][1] -= pay
-        if creditors[i][1] < 0.01: i += 1
-        if debtors[j][1] < 0.01: j += 1
+        c_uid, c_name, c_amt = creditors[i]
+        d_uid, d_name, d_amt = debtors[j]
+        
+        pay = min(c_amt, d_amt)
+        
+        transfers.append({
+            "from_uid": d_uid,
+            "from_name": d_name,
+            "to_uid": c_uid,
+            "to_name": c_name,
+            "amount": pay,
+            "expense_id": None # Пока не оплачено, ID = None
+        })
+        
+        creditors[i][2] -= pay
+        debtors[j][2] -= pay
+        if creditors[i][2] < 0.01: i += 1
+        if debtors[j][2] < 0.01: j += 1
 
-    report = "📊 <b>ИТОГИ:</b>\n\n" + ("\n".join(res) if res else "✅ Все в расчете!")
-    await message.answer(report, parse_mode="HTML")
+    if not transfers:
+        return await message.answer("✅ Все в расчете!")
+
+    # Сохраняем переводы в память для инлайн-кнопок
+    active_calcs[message.chat.id] = transfers
+    
+    text, kb = get_calc_message(message.chat.id)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+# --- CALLBACKS ДЛЯ ДОЛГОВ (НОВЫЕ ФУНКЦИИ) ---
+
+@dp.callback_query(F.data.startswith("cpay_"))
+async def toggle_calc_pay(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    idx = int(callback.data.split("_")[1])
+
+    if chat_id not in active_calcs or idx >= len(active_calcs[chat_id]):
+        return await callback.answer("Данные устарели. Нажмите /calc снова.", show_alert=True)
+
+    t = active_calcs[chat_id][idx]
+
+    if t["expense_id"] is None:
+        # ДОЛГ ПОГАШЕН: Записываем в базу как целевую трату
+        exp_id = await db.save_full_expense(
+            chat_id, 
+            payer_id=t["from_uid"], 
+            amount=t["amount"], 
+            description="💸 Возврат долга", 
+            shares=[t["to_uid"]]
+        )
+        t["expense_id"] = exp_id
+        await callback.answer("✅ Перевод отмечен и записан в базу!")
+    else:
+        # ОТМЕНА: Удаляем трату из базы
+        await db.delete_expense(t["expense_id"])
+        t["expense_id"] = None
+        await callback.answer("❌ Отметка о переводе снята!")
+
+    text, kb = get_calc_message(chat_id)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except TelegramBadRequest:
+        pass
+
+@dp.callback_query(F.data == "ping_debtors")
+async def ping_debtors_call(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    if chat_id not in active_calcs:
+        return await callback.answer("Данные устарели. Нажмите /calc снова.", show_alert=True)
+
+    debtors = set()
+    for t in active_calcs[chat_id]:
+        if t["expense_id"] is None:
+            # Тегаем пользователя через встроенную ссылку Telegram
+            debtors.add(f'<a href="tg://user?id={t["from_uid"]}">{t["from_name"]}</a>')
+
+    if not debtors:
+        return await callback.answer("Все всё перевели, должников нет! 🎉", show_alert=True)
+
+    ping_text = "💰 <b>Напоминание!</b>\nПожалуйста, не забудьте перевести деньги:\n" + ", ".join(debtors)
+    await callback.message.answer(ping_text, parse_mode="HTML")
+    await callback.answer()
+
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: types.Message):

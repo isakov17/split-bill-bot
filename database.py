@@ -86,6 +86,28 @@ async def get_balances(chat_id: int):
                         balances[uid]["balance"] -= split_amount
 
     return balances
+    
+async def get_history_with_shares(chat_id: int, limit: int = 1000):
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Сложный запрос: собираем имена участников через запятую (GROUP_CONCAT)
+        query = """
+            SELECT 
+                e.id, 
+                e.amount, 
+                e.description, 
+                p_payer.name AS payer_name,
+                GROUP_CONCAT(p_share.name, ', ') AS shared_with
+            FROM expenses e
+            LEFT JOIN participants p_payer ON e.payer_id = p_payer.user_id AND e.chat_id = p_payer.chat_id
+            LEFT JOIN expense_shares es ON e.id = es.expense_id
+            LEFT JOIN participants p_share ON es.user_id = p_share.user_id AND e.chat_id = p_share.chat_id
+            WHERE e.chat_id = ?
+            GROUP BY e.id
+            ORDER BY e.id DESC
+            LIMIT ?
+        """
+        async with db.execute(query, (chat_id, limit)) as cursor:
+            return await cursor.fetchall()
 
 async def get_history(chat_id: int, limit: int = 10):
     async with aiosqlite.connect(DB_NAME) as db:
