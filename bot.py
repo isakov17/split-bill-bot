@@ -74,50 +74,116 @@ def get_expense_keyboard(expense_key: str, participants: dict, shares: dict, pay
     
     return builder.as_markup()
 
-# --- ГЕНЕРАТОР СООБЩЕНИЯ ДЛЯ ИТОГОВ ---
 def get_calc_message(chat_id: int):
     transfers = active_calcs.get(chat_id, [])
     if not transfers:
         return "✅ Все в расчете!", None
 
-    text_lines = ["📊 <b>ИТОГИ (Кликни, чтобы отметить перевод):</b>\n"]
-    builder = InlineKeyboardBuilder()
+    text_lines = ["📊 <b>КТО КОМУ ПЕРЕВОДИТ:</b>\n"]
+    
+    senders = {}
+    for t in transfers:
+        if t["from_name"] not in senders:
+            senders[t["from_name"]] = []
+        senders[t["from_name"]].append(t)
 
-    # Группировка по получателю
-    receivers = {}
-    for idx, t in enumerate(transfers):
-        if t["to_name"] not in receivers:
-            receivers[t["to_name"]] = []
-        receivers[t["to_name"]].append((idx, t))
-
-    for recv_name, recv_transfers in receivers.items():
-        total_recv = sum(t["amount"] for _, t in recv_transfers)
-        text_lines.append(f"\n📥 <b>Получатель: {recv_name}</b> (собирает {total_recv:.2f})")
+    for sender_name, sender_transfers in senders.items():
+        total_send = sum(t["amount"] for t in sender_transfers)
+        text_lines.append(f"\n👤 <b>{sender_name}</b> (всего к оплате: {total_send:.2f})")
         
-        for idx, t in recv_transfers:
-            is_paid = t["expense_id"] is not None
-            status_icon = "✅" if is_paid else "❌"
-            strike_start = "<s>" if is_paid else ""
-            strike_end = "</s>" if is_paid else ""
+        for t in sender_transfers:
+            is_paid = t.get("expense_id") is not None
+            status = "✅" if is_paid else "❌"
+            strike_s = "<s>" if is_paid else ""
+            strike_e = "</s>" if is_paid else ""
+            text_lines.append(f"  {status} {strike_s}➔ {t['to_name']}: {t['amount']:.2f}{strike_e}")
 
-            text_lines.append(f"  {status_icon} {strike_start}от {t['from_name']} ➔ {t['amount']:.2f}{strike_end}")
-
-            # Кнопка для каждого перевода (в один столбец)
-            btn_text = f"{status_icon} {t['from_name']} ➔ {t['to_name']} ({t['amount']:.2f})"
-            builder.button(text=btn_text, callback_data=f"cpay_{idx}")
-
-    builder.adjust(1) 
+    builder = InlineKeyboardBuilder()
+    builder.row(types.InlineKeyboardButton(text="💳 Мои долги", callback_data=f"my_debts_{chat_id}"))
     builder.row(types.InlineKeyboardButton(text="🔔 Пингануть должников", callback_data="ping_debtors"))
 
     return "\n".join(text_lines), builder.as_markup()
 
+from aiogram.exceptions import TelegramForbiddenError
+
+@dp.callback_query(F.data.startswith("my_debts_"))
+async def show_personal_cabinet(callback: types.CallbackQuery):
+    chat_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    
+    if chat_id not in active_calcs:
+        return await callback.answer("Данные устарели. Обновите через /calc", show_alert=True)
+
+    # Ищем долги конкретно этого пользователя
+    user_debts = [
+        (idx, t) for idx, t in enumerate(active_calcs[chat_id]) 
+        if t["from_uid"] == user_id and t.get("expense_id") is None
+    ]
+
+    if not user_debts:
+        return await callback.answer("У вас нет неоплаченных долгов! 🎉", show_alert=True)
+
+    text_lines = ["💳 <b>Ваши неоплаченные долги:</b>\n"]
+    builder = InlineKeyboardBuilder()
+
+    for idx, t in user_debts:
+        text_lines.append(f"➔ <b>{t['to_name']}</b>: {t['amount']:.2f}")
+        # Передаем индекс перевода и chat_id для оплаты
+        builder.button(text=f"✅ Оплатил {t['to_name']} ({t['amount']:.2f})", callback_data=f"pay_{chat_id}_{idx}")
+
+    builder.adjust(1)
+
+    try:
+        # Пытаемся отправить сообщение в личку
+        await bot.send_message(user_id, "\n".join(text_lines), reply_markup=builder.as_markup(), parse_mode="HTML")
+        await callback.answer("Отправил список в личные сообщения! 📩")
+    except TelegramForbiddenError:
+        # Если бот заблокирован или не запущен пользователем
+        await callback.answer(
+            "❌ Ошибка!\nСначала напишите мне в личные сообщения (нажмите Start), чтобы я мог прислать ваши долги.", 
+            show_alert=True
+        )
+
+@dp.callback_query(F.data.startswith("pay_"))
+async def process_personal_payment(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    chat_id = int(parts[1])
+    idx = int(parts[2])
+
+    if chat_id not in active_calcs or idx >= len(active_calcs[chat_id]):
+        return await callback.message.edit_text("Данные устарели. Запросите новый список долгов в группе.")
+
+    t = active_calcs[chat_id][idx]
+
+    if t.get("expense_id") is None:
+        # Записываем в базу
+        exp_id = await db.save_full_expense(
+            chat_id, 
+            payer_id=t["from_uid"], 
+            amount=t["amount"], 
+            description="💸 Возврат долга", 
+            shares=[t["to_uid"]]
+        )
+        t["expense_id"] = exp_id
+        
+        # Обновляем сообщение в личке, убирая кнопку
+        await callback.message.edit_text(
+            f"✅ <b>Отлично!</b>\nПеревод {t['to_name']} на сумму {t['amount']:.2f} зафиксирован.",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        
+        # ОПЦИОНАЛЬНО: Можно заставить бота тут же обновить сообщение в группе, 
+        # но для этого нужно где-то хранить message_id сообщения с /calc. 
+        # Чаще всего людям проще просто написать /calc еще раз, чтобы увидеть свежий итог.
+
 
 @dp.message(Command("mock"))
 async def cmd_mock(message: types.Message):
-    fake_friends = ["Арсений", "Родион", "Кирилл", "Маша", "Дима", "Лена", "Юля", "Глеб", "Игорь", "Антон"]
+    fake_friends = ["Арсений", "Родион"]
     for i, name in enumerate(fake_friends):
         await db.add_participant(message.chat.id, 1000 + i, name)
-    await message.answer("🤖 <b>Режим теста:</b> Добавлено 10 фейковых друзей!")
+    await message.answer("🤖 <b>Режим теста:</b> Добавлено 2 фейковых друзей!")
 
 # --- ЗАЩИТА ОТ ПЕРЕЗАГРУЗКИ ---
 async def check_cache_or_delete(callback: types.CallbackQuery, expense_key: str):
@@ -360,40 +426,6 @@ async def cmd_calc(message: types.Message):
     text, kb = get_calc_message(message.chat.id)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-# --- CALLBACKS ДЛЯ ДОЛГОВ (НОВЫЕ ФУНКЦИИ) ---
-
-@dp.callback_query(F.data.startswith("cpay_"))
-async def toggle_calc_pay(callback: types.CallbackQuery):
-    chat_id = callback.message.chat.id
-    idx = int(callback.data.split("_")[1])
-
-    if chat_id not in active_calcs or idx >= len(active_calcs[chat_id]):
-        return await callback.answer("Данные устарели. Нажмите /calc снова.", show_alert=True)
-
-    t = active_calcs[chat_id][idx]
-
-    if t["expense_id"] is None:
-        # ДОЛГ ПОГАШЕН: Записываем в базу как целевую трату
-        exp_id = await db.save_full_expense(
-            chat_id, 
-            payer_id=t["from_uid"], 
-            amount=t["amount"], 
-            description="💸 Возврат долга", 
-            shares=[t["to_uid"]]
-        )
-        t["expense_id"] = exp_id
-        await callback.answer("✅ Перевод отмечен и записан в базу!")
-    else:
-        # ОТМЕНА: Удаляем трату из базы
-        await db.delete_expense(t["expense_id"])
-        t["expense_id"] = None
-        await callback.answer("❌ Отметка о переводе снята!")
-
-    text, kb = get_calc_message(chat_id)
-    try:
-        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    except TelegramBadRequest:
-        pass
 
 @dp.callback_query(F.data == "ping_debtors")
 async def ping_debtors_call(callback: types.CallbackQuery):
